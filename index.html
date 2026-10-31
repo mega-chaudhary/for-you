@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>For You</title>
+<style>
+  :root { --bg: #000; --hint: #555; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+  canvas.hide-pointer { cursor: none; }
+  #hint { position: fixed; bottom: 8px; left: 0; right: 0; text-align: center;
+          color: var(--hint); font: 12px system-ui, sans-serif; user-select: none; pointer-events: none; transition: opacity .4s; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">touch the heart to open &middot; R to replay</div>
+<script>
+// "For You" - browser version of letter.py (same scene, same timeline)
+const ENVELOPE_TEXT = "FOR YOU";
+const COLS = 104, ROWS = 52, ASP = 2.0, N = COLS * ROWS;
+const T_APPEAR0 = 0.2, T_APPEAR1 = 1.0;
+const T_COMET1 = 2.0, T_COMET2 = 2.6;   // internal: story resumes at T_COMET2 when the heart is touched
+const T_BURST = 2.75;            // the seal catches fire
+const BURN_SPEED = 26;           // how fast the burning edge spreads
+const T_ROSE = 4.4, T_LEAVES = 5.3, T_RAYS = 6.8;
+const PROMPT = "touch the heart to open";
+const D2R = Math.PI / 180, TAU = Math.PI * 2;
+
+// ---------- helpers
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const mix = (c1, c2, t) => [c1[0] + (c2[0] - c1[0]) * t, c1[1] + (c2[1] - c1[1]) * t, c1[2] + (c2[2] - c1[2]) * t];
+const scale = (c, s) => [c[0] * s, c[1] * s, c[2] * s];
+function gradient(stops, x) {
+  x = clamp(x);
+  for (let j = 0; j < stops.length - 1; j++) {
+    const [a, ca] = stops[j], [b, cb] = stops[j + 1];
+    if (x <= b) return mix(ca, cb, (x - a) / (b - a));
+  }
+  return stops[stops.length - 1][1];
+}
+const rgb = c => `rgb(${clamp(c[0], 0, 255) | 0},${clamp(c[1], 0, 255) | 0},${clamp(c[2], 0, 255) | 0})`;
+function hash01(i) {
+  i = Math.imul(i, 2654435761) >>> 0; i ^= i >>> 15;
+  i = Math.imul(i, 2246822519) >>> 0; i ^= i >>> 13;
+  return (i & 0xFFFF) / 65535;
+}
+function makeRng(seed) {
+  let a = seed >>> 0;
+  const r = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  r.uniform = (lo, hi) => lo + (hi - lo) * r();
+  r.choice = s => s[Math.floor(r() * s.length)];
+  r.randrange = n => Math.floor(r() * n);
+  return r;
+}
+const HEAT = Array.from({ length: 64 }, (_, i) => gradient([[0, [40, 0, 0]], [0.3, [170, 25, 10]],
+  [0.55, [250, 100, 20]], [0.78, [255, 200, 90]], [1, [255, 250, 230]]], i / 63));
+const FLAME_CH = " .'^:*;%#@";   // flame characters, cool -> hot
+const FLAME = Array.from({ length: 64 }, (_, i) => gradient([[0, [110, 14, 0]], [0.25, [215, 45, 5]],
+  [0.5, [255, 115, 15]], [0.75, [255, 195, 60]], [1, [255, 250, 215]]], i / 63));
+const EMBER = Array.from({ length: 64 }, (_, i) => gradient([[0, [255, 205, 90]], [0.35, [255, 120, 20]],
+  [0.7, [215, 42, 10]], [1, [105, 18, 8]]], i / 63));
+function vnoise(x, y) {   // smooth value noise in [0, 1]
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const h = (a, b) => hash01(((a * 7919 + b * 104729 + 1013) >>> 0));
+  const top = h(xi, yi) + (h(xi + 1, yi) - h(xi, yi)) * u;
+  const bot = h(xi, yi + 1) + (h(xi + 1, yi + 1) - h(xi, yi + 1)) * u;
+  return top + (bot - top) * v;
+}
+const fbm = (x, y) => 0.6 * vnoise(x, y) + 0.3 * vnoise(2 * x + 5.2, 2 * y + 1.3) + 0.1 * vnoise(4 * x + 9.1, 4 * y + 7.7);
+const FONT = {
+  F: ["#####", "#....", "####.", "#....", "#....", "#...."],
+  O: [".###.", "#...#", "#...#", "#...#", "#...#", ".###."],
+  R: ["####.", "#...#", "####.", "#.#..", "#..#.", "#...#"],
+  Y: ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#.."],
+  U: ["#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+  L: ["#....", "#....", "#....", "#....", "#....", "#####"],
+  V: ["#...#", "#...#", "#...#", ".#.#.", ".#.#.", "..#.."],
+  E: ["#####", "#....", "####.", "#....", "#....", "#####"],
+  I: ["#####", "..#..", "..#..", "..#..", "..#..", "#####"],
+  " ": ["...", "...", "...", "...", "...", "..."],
+};
+function segDist(px, py, ax, ay, bx, by) {
+  ay *= ASP; by *= ASP; py *= ASP;
+  const dx = bx - ax, dy = by - ay;
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy));
+  return Math.hypot(px - ax - dx * t, py - ay - dy * t);
+}
+const heartFn = (x, y) => (x * x + y * y - 1) ** 3 - x * x * y ** 3;
+
+// The rose, traced from a photo into characters. ROSE_ART = characters, ROSE_TINT = colour codes.
+const ROSE_ORIGIN = [2, 26];   // [row, col] of the top-left of the art
+const ROSE_ART = [
+  "                               .                     ",
+  "                            -::::                    ",
+  "           ..-==*8    &+%%&%*88&*8     :...          ",
+  "           .:=++*%%8&&8$$@$$$$@$88&&+=:::..          ",
+  "           .:*888$%$$&&%%*+==+&8$$$$$8%==-.          ",
+  "          ..:&$&%-$$88$$$$$8+=*%&8$$@@@8*-:          ",
+  "          ..-8@&$+@$8%&@$&%8$@8*&$@@$8$$88+          ",
+  "...:-+*%::::+$&$&$$8+:*@%+=-=%@@**8@@$$$=+%&%*       ",
+  "....:-+%-=--%=*$&$$%-:*@*$*==+%@8-+**$@@&+=**=       ",
+  "  ..+%&&-+*=&:%$8$@=%*:-%8$=++*@$:-*=%@$$8$8%&%      ",
+  "  ..-&$8-=8+*=8$@$$$&88=+&8*++*%+:-*&@@$+=%$$&%+%    ",
+  "   ..*@&:-&&---=8@$$+$%%8$+====&--*$@@@%-=%$88&=++=  ",
+  "    .:8%--+8%--::&@@*:%$%-*$@@$&%$$8$@@*-+8$$@%+==:..",
+  "     .===-=$@$+::%@@@@%-=$88%8888%*8$@8==&$$$$%*%-:. ",
+  "     ..:===&$@@+:-*&$@@@*=:=8$@@@8%%+=*$$$8$$&%*-:   ",
+  "      ..-++%&$@@&-:::-%$@@@$$&&8$@@@$$&%*%$8*-.:     ",
+  "       ..---=+*&@@$+----:::-+*+-::+&&&&%*+:-:.:      ",
+  "        ....::--=*8@$8**8$@@@@@@@$@@@$$$$&+=-        ",
+  "           ....::--+$$@8=-=+%&$@@%++==::-==          ",
+  "              ....::=*%8&---:::=:-==+****=:          ",
+  "                 ..:=%$$$$%**%88$88888&*==           ",
+  "                    ..:=+&&&&&&++++***++--           ",
+  "                       ..:=-:::..&&&######&&         ",
+  "                       &x.::     &##&#########&&     ",
+  "                        xx&&   &&       &&&&&%&&&    ",
+  "                   &&&&&%x%  &.##&&                  ",
+  "                  &  &&%%x%&&  &%%&&                 ",
+  "                   &&  &%x%%    &%%&#&               ",
+  "                 &%%  &xxx%&      &%&%               ",
+  "               &%xx   xxxxxx&       &                ",
+  "              &%%x&   x%%%xxx&                       ",
+  "       &&&&&&&&%%%&%%%%%%%xx%%&                      ",
+  "    &%xx%x&     &%%%xx%%%%xxx%%        &&%%%&        ",
+  "   xxxxxx%      %xxxxxxx%%%xxx%     &%%%%xxx&        ",
+  "  %xxxxx%&      &xxxxxxxx%%xxx%   &%%%%%%%x%%        ",
+  " &xxxxx%&        &%xxxxxxxxxx%&   %%%x%%%x%%%        ",
+  " %xxxx%             &%%xxxxxx&   %%x%%%%%%%%&        ",
+  " xxxxx                 &x%&x%    %%%%%%&%%%&         ",
+  " xxxx&                 &x%%%%&&&%&&%%&#&&&           ",
+  "&xxx&                &%%xxx%%%%&                     ",
+  "&xx&              &%%xxx%xxxx%&                      ",
+  "&x&             &%xxxxxxxxxx%&                       ",
+  "&               xxxxxxxxxxx%                         ",
+  "               &xxxxxxxxx%&                          ",
+  "               &&&&&&&& |||                          ",
+  "                        ||                           ",
+  "                        ||                           ",
+  "                       |||                           ",
+  "                       |||                           ",
+  "                       |||                           ",
+];
+const ROSE_TINT = [   // a-p: petal red (dark->light), A-P: leaf green (dark->light), S: stem
+  "                               c                     ",
+  "                            gffef                    ",
+  "           ccghijm    ljkklkkmmljm     eccc          ",
+  "           cehiijkkmllmoopppnopnmmlmjhgeeec          ",
+  "           cejmmmnknollkkjihhilmnonnnmkihgd          ",
+  "          ccflolkhoommnnnoomihjklmnopppmjhf          ",
+  "          cegmpmnipomklpollmppmjloppnmnnmmj          ",
+  "cccfgijkfgefjnlolnomiejpkihghkppjjmppooohiklkj       ",
+  "cccdfhjkghghlijnlookgfjpjojihikpmgikjnpplihjjh       ",
+  "  cdikllgijhlgknmophkjggkmohiijpnggjikponmnmklk      ",
+  "  ccglomghmijhmopnoolnmhilnjijkkiggjlppoiilonlkjl    ",
+  "   cdjplgglmhhghmponioklmniihhhlggknpppkghkonmlhiih  ",
+  "    cfmkggimkhgfglppjglokhjnppolknnmoppkgimonpkihhfdc",
+  "     cihighnpojgfkppppkghnmmkmmmmljmopmiilooookjkgec ",
+  "     cdfiihlnppifgjmopppjhfhmnpppmlkihknoomoolkjgf   ",
+  "      cdgiiklnpplhfffgkopppoomlmoppponlkkknmkhef     ",
+  "       cdggghijmppoighggfffhijigfgillllljiggfeg      ",
+  "        ccceffgghjmpomjjmppppppppopppooonljig        ",
+  "           cccefgggjnopmhghiklnppkjiihgfghh          ",
+  "              ccceefhjkmlggggfghgghijjjjjhf          ",
+  "                 ccehknoonkjjkmmnmmmmmljhh           ",
+  "                    cdeiilmlllliiiijkjiihh           ",
+  "                       ccehgffedeKPPNMNPPPPP         ",
+  "                       GEceg     MMNMMOPOPPPPPPP     ",
+  "                        EEHO   JJ       GGKMJHHJK    ",
+  "                   IJKKLFEG  JdONPP                  ",
+  "                  H  NMIGEFIK  IIILL                 ",
+  "                   IK  GFFFI    HIHKMK               ",
+  "                 JGI  GFFEFH      HGJI               ",
+  "               KHFF   FFFEFFG       G                ",
+  "              IFFFG   EFGFFFFG                       ",
+  "       GHJKJIIGFFIGFFFFGHGFFFFG                      ",
+  "    FFEFFFH     GFGFEFFGHGFFFGH        JJHFFG        ",
+  "   FEEEEFF      FFEEEEFFFGFFFFG     HHGHGFFFG        ",
+  "  FEEEEFGH      GFEEEEFFFFFFFFG   IGFFFGFFFFF        ",
+  " GEEEEFFJ        GFFEFEEFFFFFFH   FFFFFGFFFFG        ",
+  " FEEEEF             GFFEEFFFFG   GFFFGGFFFFFG        ",
+  " FEEEE                 FEGFFF    FGGHGHIHGFG         ",
+  " EEEEF                 GFFFFFGHIIIIIHKMMHG           ",
+  "HEFEF                HGFFFFFFFFI                     ",
+  "FEEF              GGFEEFFFFFFFG                      ",
+  "FFG             GFFFFFFFFFFFFG                       ",
+  "I               FFFFFFFFEFFF                         ",
+  "               GFFFFFFFFFFG                          ",
+  "               GFFFFFGG SSS                          ",
+  "                        SS                           ",
+  "                        SS                           ",
+  "                       SSS                           ",
+  "                       SSS                           ",
+  "                       SSS                           ",
+];
+
+function roseTint(code) {
+  if (code === "S") return [150, 70, 80];
+  if (code === code.toLowerCase()) {
+    const k = (code.charCodeAt(0) - 97) / 15;
+    return k < 0.7 ? mix([120, 6, 22], [225, 30, 45], k / 0.7) : mix([225, 30, 45], [255, 150, 160], (k - 0.7) / 0.3);
+  }
+  return mix([25, 85, 45], [150, 220, 150], (code.charCodeAt(0) - 65) / 15);
+}
+const easeOutBack = x => 1 + 2.4 * (x - 1) ** 3 + 1.4 * (x - 1) ** 2;
+
+// ---------- scene
+class Scene {
+  constructor(seed = 7) {
+    this.rng = makeRng(seed);
+    this.ex0 = 10; this.ex1 = 93; this.ey0 = 14; this.ey1 = 44;
+    this.ecx = (this.ex0 + this.ex1) / 2;
+    this.tipR = 30; this.botR = 33;
+    this.hcx = this.ecx; this.hcy = 28.5;          // wax-seal heart sits on the flap tip
+    this.loadRose(); this.buildEnvelope(); this.buildRays(); this.buildStars();
+    this.rndDx = Array.from({ length: 4096 }, () => this.rng.choice([-1, 0, 0, 1]));
+    this.rndDecay = Array.from({ length: 4096 }, () => 0.03 + this.rng() * 0.17);
+    this.reset();
+  }
+  reset() {
+    this.parts = []; this.ignited = false; this.heat = new Float32Array(N); this.fireAcc = 0; this.rndI = 0;
+    this.spawnAcc = [0, 0, 0]; this.openedAt = null; this.clock = 0; this.cursor = null; this.touchAt = null;
+  }
+  // envelope fades in and waits; touching the seal: it flares -> paper ignites there -> burns away -> rose
+  open(realT) { if (this.openedAt === null) { this.openedAt = Math.max(realT, T_APPEAR1); this.touchAt = this.cursor; } }
+  storyTime(realT) {
+    if (this.openedAt === null || realT < this.openedAt) return Math.min(realT, T_APPEAR1);
+    return T_COMET2 + (realT - this.openedAt);
+  }
+  waiting(realT) { return this.openedAt === null && realT >= T_APPEAR1 - 0.3; }
+  onHeart(c, r) { const hx = (c - this.hcx) / 11.5, hy = -(r - this.hcy) / 6.2 + 0.2; return heartFn(hx, hy) <= 0; }
+  finished(realT) { return this.storyTime(realT) > T_RAYS + 2; }
+
+  buildEnvelope() {
+    const rng = this.rng, { ex0, ex1, ey0, ey1, tipR, botR } = this, cx = this.ecx, half = cx - ex0;
+    const ink = new Set();
+    const glyphs = [...ENVELOPE_TEXT.toUpperCase()].map(ch => FONT[ch] || FONT[" "]);
+    const widths = glyphs.map(g => g[0].length * 2);
+    const total = widths.reduce((a, b) => a + b, 0) + 2 * (glyphs.length - 1);
+    let c0 = Math.round(cx - total / 2) + 1;
+    const r0 = 36;
+    glyphs.forEach((g, gi) => {
+      g.forEach((line, gy) => [...line].forEach((px, gx) => {
+        if (px === "#") { ink.add((r0 + gy) * COLS + c0 + gx * 2); ink.add((r0 + gy) * COLS + c0 + gx * 2 + 1); }
+      }));
+      c0 += widths[gi] + 2;
+    });
+    const folds = [[[ex0 + 1, ey0 + 1], [cx, tipR], "\\"], [[ex1 - 1, ey0 + 1], [cx, tipR], "/"],
+                   [[ex0 + 1, ey1 - 1], [cx, botR], "/"], [[ex1 - 1, ey1 - 1], [cx, botR], "\\"]];
+    const PAPER = [242, 214, 168];
+    this.env = [];
+    const add = (c, r, ch, col, kind) => {
+      const i = r * COLS + c, h = hash01(i + 911);
+      const tApp = T_APPEAR0 + rng() * (T_APPEAR1 - T_APPEAR0 - 0.3);
+      const d = Math.hypot(c - this.hcx, (r - this.hcy) * ASP);
+      const ragged = fbm(c * 0.09, r * 0.18) * 0.9 + fbm(c * 0.3 + 40, r * 0.6) * 0.25;
+      let tb = T_BURST + 0.1 + d / BURN_SPEED * (0.7 + ragged);
+      tb -= Math.max(0, this.hcy - r) * ASP * 0.010;
+      this.env.push({ i, c, r, ch, col, kind, tApp, tb, h });
+    };
+    for (let r = ey0; r <= ey1 + 1; r++) for (let c = ex0; c <= ex1 + 1; c++) {
+      if (r === ey1 + 1 || c === ex1 + 1) { if (r > ey0 && c > ex0) add(c, r, ".", [55, 42, 34], "shadow"); continue; }
+      const k = 1 - Math.abs(c - cx) / half;
+      const flapY = ey0 + (tipR - ey0) * k, botY = ey1 - (ey1 - botR) * k;
+      const hx = (c - this.hcx) / 9.5, hy = -(r - this.hcy) / 5.0 + 0.2, heart = heartFn(hx, hy);
+      if (heart <= 0) {
+        const rim = heart > -0.12, lit = (-hx - hy) > 0.5;
+        add(c, r, rim ? "@" : rng.choice("##@"), rim ? [150, 12, 28] : lit ? [255, 110, 125] : [200, 22, 40], "seal");
+        continue;
+      }
+      if (r === ey0 || r === ey1) {
+        const ch = (c === ex0 || c === ex1) ? (r === ey0 ? "." : "'") : "-";
+        add(c, r, ch, [205, 165, 115], "edge"); continue;
+      }
+      if (c === ex0 || c === ex1) { add(c, r, "|", [205, 165, 115], "edge"); continue; }
+      let fold = null;
+      for (const [a, b, fch] of folds) if (segDist(c, r, a[0], a[1], b[0], b[1]) < 0.62) { fold = fch; break; }
+      if (fold) { add(c, r, fold, [140, 92, 55], "fold"); continue; }
+      let panel, shade, chars;
+      if (r < flapY) { panel = "flap"; shade = 1 - 0.10 * (r - ey0) / (tipR - ey0); chars = "&&8&&8&"; }
+      else if (r > botY) { panel = "bottom"; shade = 0.78 - 0.08 * (r - botY) / (ey1 - botR); chars = "&#&&#&8"; }
+      else { panel = "side"; shade = 0.86; chars = "%&%%&%8"; }
+      if (panel === "side" && r - flapY < 1.6) shade *= 0.72;
+      const grain = 0.94 + 0.06 * fbm(c * 0.5, r * 0.9);
+      if (ink.has(r * COLS + c)) add(c, r, rng.choice("##@"), [70, 22, 18], "ink");
+      else add(c, r, rng.choice(chars), scale(PAPER, shade * grain), panel);
+    }
+  }
+
+  loadRose() {
+    const [r0, c0] = ROSE_ORIGIN, petals = [];
+    this.rose = [];
+    ROSE_ART.forEach((line, i) => [...line].forEach((ch, j) => {
+      const code = ROSE_TINT[i][j], r = r0 + i, c = c0 + j;
+      if (ch === " " || r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
+      if (code !== "S" && code === code.toLowerCase()) petals.push([c, r, ch, roseTint(code)]);
+      else this.rose.push({ i: r * COLS + c, ch, col: roseTint(code) });
+    }));
+    const cs = petals.map(q => q[0]), rs = petals.map(q => q[1]);
+    const cmin = Math.min(...cs), cmax = Math.max(...cs), rmin = Math.min(...rs), rmax = Math.max(...rs);
+    this.rx = Math.round((cmin + cmax) / 2); this.ry = Math.round((rmin + rmax) / 2);
+    this.roseR = (cmax - cmin) / 2;
+    this.head = new Map(petals.map(([c, r, ch, col]) => [(c - this.rx) + "," + (r - this.ry), [ch, col]]));
+    this.headDc = [cmin - this.rx, cmax - this.rx]; this.headDr = [rmin - this.ry, rmax - this.ry];
+  }
+
+  buildRays() {
+    const cx = this.rx, cy = this.ry;
+    this.raySpecs = [[-90, 4, 60, 1], [-62, 6, 75, 0.9], [-118, 6, 75, 0.9], [-38, 7, 85, 0.85],
+      [-142, 7, 85, 0.85], [-18, 5, 90, 0.7], [-162, 5, 90, 0.7], [-3, 2.2, 105, 1], [177, 2.2, 105, 1],
+      [18, 5, 80, 0.5], [162, 5, 80, 0.5], [45, 6, 70, 0.4], [135, 6, 70, 0.4]];
+    this.rho0 = this.roseR * 0.92; this.rays = [];
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const X = c - cx, Y = (r - cy) * ASP, rho = Math.hypot(X, Y);
+      if (rho < this.rho0) continue;
+      const th = Math.atan2(Y, X) / D2R;
+      for (let k = 0; k < this.raySpecs.length; k++) {
+        const [a, hw, L] = this.raySpecs[k];
+        const d = Math.abs((((th - a + 180) % 360) + 360) % 360 - 180);
+        if (d >= hw || rho > L) continue;
+        const axis = rho * d * D2R < 0.75, h = hash01(r * COLS + c + 31);
+        const fall = 1 - (rho - this.rho0) / (L - this.rho0);
+        if (axis || h < 0.06 + 0.34 * fall) this.rays.push({ i: r * COLS + c, rho, k, axis, h });
+        break;
+      }
+    }
+  }
+  buildStars() {
+    const rng = this.rng;
+    this.stars = Array.from({ length: 80 }, () => [rng.randrange(N), rng.uniform(1.5, 4), rng.uniform(0, TAU)]);
+  }
+  cometPos(t) {   // the purple flame that marks your finger / mouse
+    if (this.openedAt === null) return t >= T_APPEAR1 - 0.3 ? this.cursor : null;
+    return t < T_BURST ? this.touchAt : null;
+  }
+  emit(x, y, vx, vy, life, kind) { this.parts.push([x, y, vx, vy, life, life, kind]); }
+
+  // classic cellular fire: heat rises one row per step, drifting and cooling
+  stepFlames(sources) {
+    const heat = this.heat, dxs = this.rndDx, decs = this.rndDecay;
+    let n = this.rndI;
+    const cLo = Math.max(1, this.ex0 - 6), cHi = Math.min(COLS - 2, this.ex1 + 6);
+    for (let r = 0; r <= this.ey1 + 1; r++) {
+      const base = r * COLS, below = base + COLS;
+      for (let c = cLo; c <= cHi; c++) {
+        n = (n + 1) & 4095;
+        const v = heat[below + c + dxs[n]] - decs[n];
+        heat[base + c] = v > 0 ? v : 0;
+      }
+    }
+    this.rndI = n;
+    const bottom = (this.ey1 + 2) * COLS;
+    for (let c = cLo; c <= cHi; c++) heat[bottom + c] = 0;
+    for (const i of sources) if (this.rng() < 0.38) { const v = 0.55 + 0.45 * this.rng(); if (v > heat[i]) heat[i] = v; }
+  }
+
+  updateParticles(t, dt, burning, charred) {
+    const rng = this.rng;
+    if (t >= T_BURST && !this.ignited) {
+      this.ignited = true;
+      for (let n = 0; n < 45; n++) { const a = rng.uniform(0, TAU), sp = rng.uniform(6, 22);
+        this.emit(this.hcx, this.hcy, Math.cos(a) * sp, Math.sin(a) * sp / ASP - 3, rng.uniform(0.4, 1.0), 1); }
+    }
+    const acc = this.spawnAcc;
+    if (burning.length) {
+      acc[0] += dt * 55; acc[1] += dt * 32;
+      while (acc[0] >= 1) { acc[0] -= 1; const [c, r] = rng.choice(burning);
+        this.emit(c, r, rng.uniform(-3, 3), rng.uniform(-13, -5), rng.uniform(0.4, 1.3), 1); }
+      while (acc[1] >= 1) { acc[1] -= 1; const [c, r] = rng.choice(burning);
+        this.emit(c, r - 3, rng.uniform(-1.5, 1.5) + 0.8, rng.uniform(-6, -3), rng.uniform(1.4, 2.8), 3); }
+    }
+    if (charred.length) {
+      acc[2] += dt * 28;
+      while (acc[2] >= 1) { acc[2] -= 1; const [c, r] = rng.choice(charred);
+        this.emit(c, r, rng.uniform(-2, 2), rng.uniform(-5, -1.5), rng.uniform(1.0, 2.4), 4); }
+    }
+    const cp = this.cometPos(t);
+    if (cp && rng() < 0.5) this.emit(cp[0] + rng.uniform(-2, 2), cp[1] + rng.uniform(0, 9), rng.uniform(-6, 6), rng.uniform(-3, 1), rng.uniform(0.2, 0.5), 2);
+    this.parts = this.parts.filter(p => {
+      p[4] -= dt; if (p[4] <= 0) return false;
+      const kind = p[6];
+      if (kind === 1) { p[2] += Math.sin(t * 7 + p[1]) * 6 * dt; p[3] -= 2 * dt; }
+      else if (kind === 3) { p[3] *= 1 - 0.4 * dt; p[2] += Math.sin(t * 1.3 + p[1] * 0.4) * 1.5 * dt; }
+      else if (kind === 4) { p[2] += Math.sin(t * 3 + p[0] * 0.7) * 8 * dt; p[3] += 1.2 * dt; }
+      p[0] += p[2] * dt; p[1] += p[3] * dt; return true;
+    });
+  }
+
+  frame(realT, dt) {
+    this.clock = realT;
+    const t = this.storyTime(realT), waiting = this.waiting(realT);
+    const chars = new Array(N).fill(" "), cols = new Array(N);
+    const tq = Math.floor(t * 12) / 12;
+    const put = (i, ch, c) => { chars[i] = ch; cols[i] = c; };
+
+    const sv = smooth(T_BURST + 1, T_BURST + 2.5, t);
+    if (sv > 0) for (const [i, w, ph] of this.stars) {
+      const b = 0.5 + 0.5 * Math.sin(tq * w + ph);
+      put(i, b > 0.85 ? "•" : ".", scale([240, 240, 255], (0.3 + 0.7 * b) * sv));
+    }
+    if (t > T_RAYS) {
+      const grow = this.rho0 + (t - T_RAYS) * 70;
+      for (const { i, rho, k, axis, h } of this.rays) {
+        if (rho > grow) continue;
+        const [, , L, s] = this.raySpecs[k];
+        const fade = s * (1 - (rho - this.rho0) / (L - this.rho0)) ** 0.8;
+        const tip = grow < L + 6 ? 1 + 1.5 * Math.max(0, 1 - (grow - rho) / 6) : 1;
+        if (axis) {
+          if ((((rho - tq * 22 + k * 5) % 8) + 8) % 8 < 1.3) put(i, "•", mix([170, 210, 255], [255, 255, 255], fade));
+          else put(i, k === 0 ? "+" : "=", scale(mix([50, 90, 200], [140, 190, 255], fade), Math.min(1.6, tip)));
+        } else {
+          const b = fade * (0.55 + 0.45 * Math.sin(tq * 4 + h * 40)) * tip;
+          if (b < 0.08) continue;
+          put(i, h < 0.3 ? "-" : "=", mix([20, 40, 120], [90, 150, 255], clamp(b)));
+        }
+      }
+    }
+    // stem and leaves (the paper covers them until it burns away)
+    if (t > T_LEAVES) for (const { i, ch, col } of this.rose) {
+      const d = (Math.floor(i / COLS) - this.ry) / ROWS * 0.6;
+      const a = smooth(T_LEAVES + d, T_LEAVES + d + 0.5, t);
+      if (a < 0.08) continue;
+      const k = smooth(T_LEAVES + 0.5 + d, T_LEAVES + 1.1 + d, t);
+      put(i, ch, scale(mix([255, 225, 140], col, k), a));
+    }
+    // the letter, and the paper burning
+    const burning = [], charred = [];
+    if (t < T_RAYS + 1) {
+      const sealGlow = (waiting && this.cursor && this.onHeart(this.cursor[0], this.cursor[1])) ? 1 : 0;
+      const flare = smooth(T_COMET2, T_BURST, t);
+      for (const { i, c, r, ch, col, kind, tApp, tb, h } of this.env) {
+        const a = smooth(tApp, tApp + 0.3, t);
+        if (a < 0.1) continue;
+        let cur = col, chh = ch;
+        if (kind === "seal" && t < T_BURST + 0.2) {
+          let pulse = 0;
+          if (waiting) { const ph = (this.clock * 1.3) % 1;
+            pulse = Math.max(Math.exp(-(((ph - 0.1) / 0.06) ** 2)), Math.exp(-(((ph - 0.32) / 0.06) ** 2))); }
+          cur = mix(cur, [255, 120, 150], pulse * 0.6 + sealGlow * 0.3);
+          cur = mix(cur, [255, 240, 200], flare);
+        }
+        if (t > T_BURST) {
+          const u = t - tb;
+          if (u >= 0.75) continue;                                   // burnt through
+          if (u >= 0.26) {                                           // charred, curling edge
+            if (kind === "shadow") continue;
+            const k = (u - 0.26) / 0.49;
+            chh = "~^,.'"[Math.min(4, Math.floor(k * 5 + h * 1.5))];
+            cur = mix([72, 42, 26], [28, 20, 16], k);
+            if (hash01(i + Math.floor(t * 10) * 131) < 0.10 * (1 - k)) { chh = "."; cur = [255, 95, 30]; }
+            if (h < 0.12) charred.push([c, r]);
+          } else if (u >= 0.06) {                                    // glowing embers
+            const k = (u - 0.06) / 0.20, fl = hash01(i + Math.floor(t * 15) * 977);
+            cur = EMBER[Math.floor(clamp(k + 0.18 * (fl - 0.5)) * 63)];
+            chh = "&%*x#"[Math.floor(h * 5)];
+            burning.push(i);
+          } else if (u >= 0) {                                       // the burning line itself
+            cur = h < 0.5 ? [255, 246, 200] : [255, 215, 110];
+            chh = h < 0.35 ? "#" : h < 0.7 ? "*" : "%";
+            burning.push(i);
+          } else if (kind !== "shadow") {                            // paper browns ahead of it
+            const sc = smooth(-0.9, 0, u);
+            if (sc > 0) {
+              cur = mix(cur, [150, 88, 40], sc * 0.85);
+              if (sc > 0.6) cur = mix(cur, [70, 30, 12], (sc - 0.6) / 0.4 * 0.8);
+            }
+          }
+        }
+        put(i, chh, scale(cur, a));
+      }
+    }
+    // flames rising off the burning edge
+    if (t > T_BURST && t < T_RAYS + 1.5) {
+      this.fireAcc += dt;
+      let steps = 0;
+      while (this.fireAcc >= 1 / 30 && steps < 3) { this.fireAcc -= 1 / 30; steps++; this.stepFlames(burning); }
+      const heat = this.heat, burningSet = new Set(burning);
+      for (let r = 0; r <= this.ey1 + 1; r++) {
+        const base = r * COLS;
+        for (let c = Math.max(0, this.ex0 - 6); c < Math.min(COLS, this.ex1 + 7); c++) {
+          const v = heat[base + c];
+          if (v <= 0.1) continue;
+          const i = base + c;
+          if (v < 0.4 && chars[i] !== " " && !burningSet.has(i)) continue;   // faint heat hides behind paper
+          put(i, FLAME_CH[Math.min(9, Math.floor(v * 10))], FLAME[Math.min(63, Math.floor(v * 60))]);
+        }
+      }
+    }
+    if (t > T_ROSE) {   // rose bud grows up from the stem and opens into the full bloom
+      const e = easeOutBack(smooth(T_ROSE, T_ROSE + 2.2, t));
+      const sx = 0.16 + 0.84 * e, sy = 0.35 + 0.65 * e;
+      const a = smooth(T_ROSE, T_ROSE + 0.25, t);
+      const glow = 1 + 0.3 * (1 - smooth(T_ROSE + 1.2, T_ROSE + 2.6, t));
+      const [top, bot] = this.headDr;
+      for (let dr = top - 4; dr <= bot; dr++) {
+        const sdr = Math.round(bot + (dr - bot) / sy);
+        if (sdr < top) continue;
+        for (let dc = this.headDc[0] - 5; dc <= this.headDc[1] + 5; dc++) {
+          const cell = this.head.get(Math.round(dc / sx) + "," + sdr);
+          if (!cell) continue;
+          const r = this.ry + dr, c = this.rx + dc;
+          if (r >= 0 && r < ROWS && c >= 0 && c < COLS) put(r * COLS + c, cell[0], scale(cell[1], a * glow));
+        }
+      }
+    }
+    const cp = this.cometPos(t);
+    if (cp) {   // finger / cursor flame (pointer is at its top centre)
+      const [fx, fy] = cp, glow = smooth(T_COMET2, T_BURST, t);
+      const stops = [[0, [240, 110, 175]], [0.35, [165, 90, 235]], [0.7, [100, 120, 255]], [1, [235, 235, 255]]];
+      for (let j = 0; j < 11; j++) {
+        const hwj = 3.6 * (1 - j / 11) ** 0.9 + 0.4, r = Math.round(fy) + j;
+        if (r < 0 || r >= ROWS) continue;
+        const col = mix(gradient(stops, j / 10), [255, 255, 255], glow * 0.7);
+        for (let c = Math.floor(fx - hwj); c <= Math.ceil(fx + hwj); c++)
+          if (c >= 0 && c < COLS && Math.abs(c - fx) <= hwj) put(r * COLS + c, Math.abs(c - fx) < hwj - 0.8 ? "=" : "-", col);
+      }
+    }
+    this.updateParticles(t, dt, burning.filter((_, k) => k % 3 === 0).map(i => [i % COLS, Math.floor(i / COLS)]), charred);
+    for (const [x, y, , , life, ml, kind] of this.parts) {
+      const xi = Math.round(x), yi = Math.round(y);
+      if (xi < 0 || xi >= COLS || yi < 0 || yi >= ROWS) continue;
+      const k = life / ml, i = yi * COLS + xi;
+      let ch, col;
+      if (kind === 1) { ch = k > 0.65 ? "*" : k > 0.35 ? "'" : "."; col = HEAT[Math.floor(20 + 43 * k)]; }
+      else if (kind === 3) { if (chars[i] !== " ") continue; ch = k > 0.5 ? "~" : "."; col = scale([95, 92, 98], 0.25 + 0.6 * k * (1 - k) * 2); }
+      else if (kind === 4) { ch = k > 0.6 ? "," : k > 0.3 ? "'" : "."; col = scale([130, 120, 112], 0.35 + 0.65 * k); }
+      else { ch = "."; col = scale([190, 140, 255], 0.4 + 0.6 * k); }
+      put(i, ch, col);
+    }
+    if (waiting && PROMPT) {
+      const k = 0.72 + 0.28 * Math.sin(this.clock * 3), r = this.ey1 + 3, c0 = Math.floor((COLS - PROMPT.length) / 2);
+      [...PROMPT].forEach((chh, j) => { if (chh !== " ") put(r * COLS + c0 + j, chh, scale([255, 170, 205], k)); });
+      for (const [j, chh] of [[-3, "<"], [-2, "3"], [PROMPT.length + 1, "<"], [PROMPT.length + 2, "3"]])
+        put(r * COLS + c0 + j, chh, scale([255, 90, 160], k));
+    }
+    return [chars, cols];
+  }
+}
+
+// ---------- render loop
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let cw = 7, chH = 14, scene = new Scene(), start = performance.now(), last = start;
+function layout() {
+  const dpr = window.devicePixelRatio || 1;
+  const cell = Math.max(2, Math.min(window.innerWidth * 0.98 / COLS, window.innerHeight * 0.95 / ROWS * 2) );
+  cw = cell; chH = cell * 2;
+  cv.style.width = cw * COLS + "px"; cv.style.height = chH * ROWS + "px";
+  cv.width = Math.round(cw * COLS * dpr); cv.height = Math.round(chH * ROWS * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = `bold ${Math.round(chH * 0.86)}px Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", monospace`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+}
+function replay() { scene.reset(); cv.classList.add("hide-pointer"); document.getElementById("hint").style.opacity = 0.6; start = last = performance.now(); }
+function toCell(e) {
+  const b = cv.getBoundingClientRect();
+  return [clamp(Math.floor((e.clientX - b.left) / cw), 0, COLS - 1), clamp(Math.floor((e.clientY - b.top) / chH), 0, ROWS - 1)];
+}
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  const t = (now - start) / 1000;
+  const [chars, cols] = scene.frame(t, dt);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cw * COLS, chH * ROWS);
+  for (let i = 0; i < N; i++) {
+    if (chars[i] === " ") continue;
+    ctx.fillStyle = rgb(cols[i]);
+    ctx.fillText(chars[i], (i % COLS) * cw + cw / 2, Math.floor(i / COLS) * chH + chH / 2);
+  }
+  requestAnimationFrame(loop);
+}
+window.addEventListener("resize", layout);
+function openLetter() { scene.open((performance.now() - start) / 1000); cv.classList.remove("hide-pointer"); document.getElementById("hint").style.opacity = 0; }
+window.addEventListener("pointermove", e => scene.cursor = toCell(e));
+cv.addEventListener("pointerleave", e => { if (e.pointerType === "mouse") scene.cursor = null; });
+window.addEventListener("pointerdown", e => {
+  const realT = (performance.now() - start) / 1000, cell = toCell(e);
+  scene.cursor = cell;
+  if (scene.finished(realT)) replay();
+  else if (scene.waiting(realT) && scene.onHeart(cell[0], cell[1])) openLetter();
+});
+window.addEventListener("keydown", e => {
+  const realT = (performance.now() - start) / 1000;
+  if (e.key === "r" || e.key === "R") replay();
+  else if (e.key === " " || e.key === "Enter") {
+    if (scene.finished(realT)) replay();
+    else if (scene.waiting(realT)) { scene.cursor = [scene.hcx, scene.hcy]; openLetter(); }
+  }
+});
+cv.classList.add("hide-pointer");
+layout(); requestAnimationFrame(loop);
+setTimeout(() => { const h = document.getElementById("hint"); if (h) h.style.opacity = 0.6; }, 0);
+</script>
+</body>
+</html>
